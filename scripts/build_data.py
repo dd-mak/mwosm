@@ -1,47 +1,49 @@
 #!/usr/bin/env python3
-"""Build Tanzania road + railway data from OSM into data/*.geojson + data/meta.json."""
-import json, math, os, sys, time, datetime, urllib.parse, urllib.request
+"""Build Malawi roads + railways + tourism from an OSM PBF file.
 
-OVP = ["https://overpass-api.de/api/interpreter",
-       "https://overpass.kumi.systems/api/interpreter",
-       "https://overpass.private.coffee/api/interpreter"]
+Usage:
+    python scripts/build_data.py malawi-latest.osm.pbf
+    python scripts/build_data.py /tmp/mw.osm.pbf --out data
+"""
+import json, math, os, sys, argparse, datetime
+from collections import defaultdict
 
-GROUPS = {
-    "roads_t1": (1, ["motorway", "trunk", "primary"]),
-    "roads_t2": (2, ["secondary", "tertiary"]),
-    "roads_unclassified": (3, ["unclassified"]),
-    "roads_residential":  (3, ["residential"]),
-    "roads_track":        (3, ["track"]),
-    "roads_service":      (3, ["service"]),
-    "roads_path":         (3, ["path"]),
+try:
+    import osmium
+except ImportError:
+    sys.exit("Run: pip install osmium")
+
+
+HIGHWAYS = {
+    "motorway", "trunk", "primary", "secondary", "tertiary",
+    "unclassified", "residential", "track", "service", "path",
 }
-EXTRA = {"path": ["path", "footway", "cycleway", "pedestrian", "steps", "bridleway"],
-         "residential": ["residential", "living_street"],
-         "unclassified": ["unclassified", "road"]}
-HW = {"living_street": "residential", "road": "unclassified", "footway": "path",
-      "cycleway": "path", "pedestrian": "path", "steps": "path", "bridleway": "path"}
-PAVED = set("asphalt paved concrete paving_stones sett concrete:plates concrete:lanes "
-            "bricks cobblestone chipseal metal".split())
+NORMALIZE = {
+    "living_street": "residential", "road": "unclassified",
+    "footway": "path", "cycleway": "path", "pedestrian": "path",
+    "steps": "path", "bridleway": "path",
+}
+RAILWAY = {"rail", "narrow_gauge", "light_rail", "subway", "tram"}
+PAVED = set("asphalt paved concrete paving_stones sett concrete:plates "
+            "concrete:lanes bricks cobblestone chipseal metal".split())
 
-RAIL = ["rail", "narrow_gauge", "light_rail", "subway", "tram"]
-
-
-def load_config(path="config.json"):
-    cfg = json.load(open(path))
-    need = {"id", "name", "relation_id", "bounds", "languages",
-            "default_lang", "admin", "accent"}
-    if need - cfg.keys():
-        sys.exit(f"config.json missing: {sorted(need - cfg.keys())}")
-    cfg["area"] = f"area(id:{3600000000 + int(cfg['relation_id'])})->.a;"
-    return cfg
+PARK_BOUNDARY = {"national_park", "protected_area"}
+NATURAL_TOURISM = {"beach", "bay"}
+TOURISM_POI = {
+    "attraction", "viewpoint", "artwork", "hotel", "guest_house",
+    "camp_site", "hostel", "museum", "gallery", "information",
+    "zoo", "picnic_site", "theme_park", "alpine_hut", "wilderness_hut",
+    "chalet", "apartment", "caravan_site", "motel",
+}
 
 
 def km(coords):
-    d = 0
+    d = 0.0
     for (x1, y1), (x2, y2) in zip(coords, coords[1:]):
         p = math.pi / 180
         h = (math.sin((y2 - y1) * p / 2) ** 2 +
-             math.cos(y1 * p) * math.cos(y2 * p) * math.sin((x2 - x1) * p / 2) ** 2)
+             math.cos(y1 * p) * math.cos(y2 * p) *
+             math.sin((x2 - x1) * p / 2) ** 2)
         d += 12742 * math.asin(math.sqrt(h))
     return round(d, 3)
 
@@ -51,89 +53,127 @@ def num(v):
     except Exception: return None
 
 
-def road_feature(e, known):
-    t = e.get("tags", {})
-    c = HW.get(t.get("highway", "").replace("_link", ""), t.get("highway", "").replace("_link", ""))
-    if c not in known or "geometry" not in e:
+def tags_of(o):
+    return {t.k: t.v for t in o.tags}
+
+
+def road_feature(w, tags, coords):
+    hw = tags.get("highway", "")
+    cls = NORMALIZE.get(hw, hw.replace("_link", ""))
+    if cls not in HIGHWAYS:
         return None
-    co = [[round(g["lon"], 5), round(g["lat"], 5)] for g in e["geometry"]]
-    if len(co) < 2:
-        return None
-    su = t.get("surface", "")
-    tt = t.get("tracktype", "")
+    su = tags.get("surface", "")
+    tt = tags.get("tracktype", "")
     tg = "na"
-    if c == "track":
+    if cls == "track":
         tg = "g" + tt[5:] if tt[:5] == "grade" and tt[5:] in "12345" else "none"
     return {
         "type": "Feature",
-        "geometry": {"type": "LineString", "coordinates": co},
+        "geometry": {"type": "LineString", "coordinates": coords},
         "properties": {
-            "id": e["id"], "cls": c, "hw": t.get("highway", ""), "tg": tg,
-            "name": t.get("name", ""), "ref": t.get("ref", ""), "surface": su,
+            "id": w.id, "cls": cls, "hw": hw, "tg": tg,
+            "name": tags.get("name", ""), "ref": tags.get("ref", ""),
+            "surface": su,
             "sc": "unknown" if not su else "paved" if su in PAVED else "unpaved",
-            "speed": num(t.get("maxspeed")),
-            "lit": "unk" if "lit" not in t else "no" if t["lit"] == "no" else "yes",
-            "km": km(co),
+            "speed": num(tags.get("maxspeed")),
+            "lit": "unk" if "lit" not in tags else ("no" if tags["lit"] == "no" else "yes"),
+            "km": km(coords),
         },
     }
 
 
-def rail_feature(e):
-    t = e.get("tags", {})
-    rt = t.get("railway", "")
-    if rt not in RAIL or "geometry" not in e:
-        return None
-    co = [[round(g["lon"], 5), round(g["lat"], 5)] for g in e["geometry"]]
-    if len(co) < 2:
+def rail_feature(w, tags, coords):
+    rt = tags.get("railway", "")
+    if rt not in RAILWAY:
         return None
     return {
         "type": "Feature",
-        "geometry": {"type": "LineString", "coordinates": co},
+        "geometry": {"type": "LineString", "coordinates": coords},
         "properties": {
-            "id": e["id"], "rt": rt,
-            "name": t.get("name", ""), "ref": t.get("ref", ""),
-            "usage": t.get("usage", ""),
-            "gauge": t.get("gauge", ""),
-            "electrified": t.get("electrified", "no"),
-            "km": km(co),
+            "id": w.id, "rt": rt,
+            "name": tags.get("name", ""), "ref": tags.get("ref", ""),
+            "usage": tags.get("usage", ""),
+            "gauge": tags.get("gauge", ""),
+            "electrified": tags.get("electrified", "no"),
+            "km": km(coords),
         },
     }
 
 
-def overpass(query, tries=8):
-    last = None
-    for i in range(tries):
-        url = OVP[i % len(OVP)]
+def tourism_kind(tags):
+    b = tags.get("boundary")
+    if b in PARK_BOUNDARY:
+        return ("park", b)
+    nat = tags.get("natural")
+    if nat in NATURAL_TOURISM:
+        return ("natural", nat)
+    tou = tags.get("tourism")
+    if tou in TOURISM_POI:
+        return ("poi", tou)
+    return None
+
+
+def tourism_props(o, tags, kind_cat):
+    kind, cat = kind_cat
+    p = {"id": o.id, "kind": kind, "cat": cat, "name": tags.get("name", "")}
+    for k in ("ele", "website", "phone", "opening_hours",
+              "description", "wikipedia", "operator"):
+        if k in tags:
+            p[k] = tags[k]
+    return p
+
+
+class Extract(osmium.SimpleHandler):
+    def __init__(self):
+        super().__init__()
+        self.roads = []
+        self.railways = []
+        self.tourism_pts = []
+        self.tourism_areas = []
+
+    def node(self, n):
+        if not n.tags:
+            return
+        tags = tags_of(n)
+        kc = tourism_kind(tags)
+        if not kc:
+            return
+        self.tourism_pts.append({
+            "type": "Feature",
+            "geometry": {"type": "Point",
+                         "coordinates": [round(n.location.lon, 5),
+                                         round(n.location.lat, 5)]},
+            "properties": tourism_props(n, tags, kc),
+        })
+
+    def way(self, w):
+        if not w.tags:
+            return
+        tags = tags_of(w)
         try:
-            req = urllib.request.Request(
-                url,
-                data=urllib.parse.urlencode({"data": query}).encode(),
-                headers={"User-Agent": "tz-roads/1.0 (31 Day OSM Challenge)"})
-            j = json.load(urllib.request.urlopen(req, timeout=900))
-            if "remark" in j and "error" in j["remark"].lower():
-                raise RuntimeError(j["remark"])
-            return j["elements"]
-        except Exception as ex:
-            last = ex
-            wait = min(120, 15 * (i + 1))
-            print(f"  attempt {i+1}: {ex} — waiting {wait}s", file=sys.stderr)
-            time.sleep(wait)
-    raise last
+            coords = [[round(n.lon, 5), round(n.lat, 5)] for n in w.nodes]
+        except Exception:
+            return
+        if len(coords) < 2:
+            return
 
+        r = road_feature(w, tags, coords)
+        if r:
+            self.roads.append(r)
+            return
 
-def query(area, classes, bbox=None):
-    tags = "|".join(x for c in classes
-                    for x in ([c, c + "_link"]
-                              if c in ("motorway", "trunk", "primary", "secondary", "tertiary")
-                              else EXTRA.get(c, [c])))
-    geo = f"({','.join(map(str, bbox))})" if bbox else "(area.a)"
-    return f'[out:json][timeout:900];{area}way["highway"~"^({tags})$"]{geo};out geom tags;'
+        r = rail_feature(w, tags, coords)
+        if r:
+            self.railways.append(r)
+            return
 
-
-def rail_query(area, bbox=None):
-    tags = "|".join(RAIL)
-    geo = f"({','.join(map(str, bbox))})" if bbox else "(area.a)"
-    return f'[out:json][timeout:300];{area}way["railway"~"^({tags})$"]{geo};out geom tags;'
+        kc = tourism_kind(tags)
+        if kc and len(coords) >= 4 and coords[0] == coords[-1]:
+            self.tourism_areas.append({
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [coords]},
+                "properties": tourism_props(w, tags, kc),
+            })
 
 
 def write_geojson(path, feats):
@@ -143,105 +183,74 @@ def write_geojson(path, feats):
                  "\n]}")
 
 
-def fetch_regions(cfg):
-    q = (f'[out:json][timeout:120];{cfg["area"]}'
-         f'relation["admin_level"="{cfg["admin"]["level"]}"]["boundary"="administrative"](area.a);'
-         f'out tags bb;')
-    out = []
-    for r in overpass(q):
-        bb = r.get("bounds")
-        if not bb:
-            continue
-        out.append({
-            "id": r["id"],
-            "name": r.get("tags", {}).get("name", str(r["id"])),
-            "bbox": [bb["minlat"], bb["minlon"], bb["maxlat"], bb["maxlon"]],
-        })
-    print(f"  {len(out)} admin regions")
-    return out
-
-
-def main(out_dir="data"):
-    cfg = load_config()
-    os.makedirs(out_dir, exist_ok=True)
-    meta = {
-        "country": cfg["id"], "name": cfg["name"],
-        "updated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
-        "files": {"1": [], "2": [], "3": []},
-        "regions": [], "counts": {},
-    }
-
-    for name, (tier, classes) in GROUPS.items():
-        if tier >= 3:
-            continue
-        path = os.path.join(out_dir, name + ".geojson")
-        print(f"{name}: {classes}")
-        try:
-            feats = [f for f in (road_feature(e, set(classes))
-                                 for e in overpass(query(cfg["area"], classes))) if f]
-            feats.sort(key=lambda f: f["properties"]["id"])
-            write_geojson(path, feats)
-            meta["counts"][name] = len(feats)
-            meta["files"][str(tier)].append(name + ".geojson")
-            print(f"  {len(feats)} segments, {os.path.getsize(path)/1e6:.1f} MB")
-        except Exception as ex:
-            print(f"  FAILED ({ex})", file=sys.stderr)
-            if os.path.exists(path):
-                meta["files"][str(tier)].append(name + ".geojson")
-        time.sleep(10)
-
-    print("railways")
-    try:
-        feats = [f for f in (rail_feature(e) for e in overpass(rail_query(cfg["area"]))) if f]
-        feats.sort(key=lambda f: f["properties"]["id"])
-        write_geojson(os.path.join(out_dir, "railways.geojson"), feats)
-        meta["counts"]["railways"] = len(feats)
-        meta["files"]["1"].append("railways.geojson")
-        print(f"  {len(feats)} segments")
-    except Exception as ex:
-        print(f"  FAILED ({ex})", file=sys.stderr)
-        if os.path.exists(os.path.join(out_dir, "railways.geojson")):
-            meta["files"]["1"].append("railways.geojson")
-    time.sleep(10)
-
-    regions = fetch_regions(cfg)
-    t3_classes = [c for n, (t, cs) in GROUPS.items() if t == 3 for c in cs]
-
-    print("tier 3: local roads")
-    els = []
-    for r in regions:
-        try:
-            got = overpass(query(cfg["area"], t3_classes, r["bbox"]))
-            els += got
-            print(f"  {r['name']}: {len(got)}")
-        except Exception as ex:
-            print(f"  {r['name']}: FAILED ({ex})", file=sys.stderr)
-        time.sleep(5)
-
-    feats = [f for f in (road_feature(e, set(t3_classes)) for e in els) if f]
-    buckets = {r["id"]: [] for r in regions}
+def count_by(feats, key):
+    out = defaultdict(int)
     for f in feats:
-        x, y = f["geometry"]["coordinates"][0]
-        for r in regions:
-            s, w, n, e = r["bbox"]
-            if w <= x <= e and s <= y <= n:
-                buckets[r["id"]].append(f)
-                break
+        out[key(f)] += 1
+    return dict(sorted(out.items(), key=lambda x: -x[1]))
 
-    reg_dir = os.path.join(out_dir, "regions")
-    os.makedirs(reg_dir, exist_ok=True)
-    for r in regions:
-        fs = buckets[r["id"]]
-        if not fs:
-            continue
-        rel = f"regions/{r['id']}.geojson"
-        write_geojson(os.path.join(out_dir, rel), fs)
-        meta["regions"].append({"id": r["id"], "name": r["name"],
-                                "file": rel, "count": len(fs),
-                                "bbox": r["bbox"]})
-        meta["files"]["3"].append(rel)
 
-    json.dump(meta, open(os.path.join(out_dir, "meta.json"), "w"), indent=1)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pbf", help="path to .osm.pbf file")
+    ap.add_argument("--out", default="data")
+    args = ap.parse_args()
+
+    if not os.path.exists(args.pbf):
+        sys.exit(f"PBF not found: {args.pbf}")
+    os.makedirs(args.out, exist_ok=True)
+
+    print(f"Reading {args.pbf} …")
+    ex = Extract()
+    ex.apply_file(args.pbf, locations=True)
+    print(f"  roads:          {len(ex.roads):,}")
+    print(f"  railways:       {len(ex.railways):,}")
+    print(f"  tourism points: {len(ex.tourism_pts):,}")
+    print(f"  tourism areas:  {len(ex.tourism_areas):,}")
+
+    GRID = 0.5
+    cells = defaultdict(list)
+    for r in ex.roads:
+        x, y = r["geometry"]["coordinates"][0]
+        cells[(math.floor(x / GRID), math.floor(y / GRID))].append(r)
+
+    roads_dir = os.path.join(args.out, "roads")
+    os.makedirs(roads_dir, exist_ok=True)
+    regions = []
+    for (cx, cy), fs in cells.items():
+        name = f"{cx}_{cy}.geojson"
+        write_geojson(os.path.join(roads_dir, name), fs)
+        regions.append({
+            "file": f"roads/{name}",
+            "bbox": [cy * GRID, cx * GRID, (cy + 1) * GRID, (cx + 1) * GRID],
+            "count": len(fs),
+        })
+    print(f"  → {len(regions)} road cells")
+
+    write_geojson(os.path.join(args.out, "railways.geojson"), ex.railways)
+
+    tourism = ex.tourism_pts + ex.tourism_areas
+    write_geojson(os.path.join(args.out, "tourism.geojson"), tourism)
+
+    stats = {
+        "roads": len(ex.roads),
+        "roads_km": round(sum(r["properties"]["km"] for r in ex.roads), 1),
+        "railways": len(ex.railways),
+        "railways_km": round(sum(r["properties"]["km"] for r in ex.railways), 1),
+        "tourism": len(tourism),
+        "tourism_by_cat": count_by(tourism, lambda f: f["properties"]["cat"]),
+        "tourism_by_kind": count_by(tourism, lambda f: f["properties"]["kind"]),
+    }
+    json.dump(stats, open(os.path.join(args.out, "stats.json"), "w"), indent=1)
+
+    meta = {
+        "updated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d"),
+        "regions": regions,
+        "single_files": ["railways.geojson", "tourism.geojson"],
+    }
+    json.dump(meta, open(os.path.join(args.out, "meta.json"), "w"), indent=1)
+
+    print("Done.")
 
 
 if __name__ == "__main__":
