@@ -1,0 +1,36 @@
+{
+ "roads": 465874,
+ "roads_km": 204781.2,
+ "railways": 524,
+ "railways_km": 1031.3,
+ "tourism": 1210,
+ "tourism_by_cat": {
+  "hotel": 264,
+  "hostel": 171,
+  "guest_house": 169,
+  "beach": 110,
+  "viewpoint": 107,
+  "attraction": 85,
+  "camp_site": 81,
+  "artwork": 47,
+  "motel": 42,
+  "information": 25,
+  "protected_area": 24,
+  "apartment": 18,
+  "alpine_hut": 14,
+  "bay": 13,
+  "picnic_site": 11,
+  "museum": 10,
+  "chalet": 9,
+  "wilderness_hut": 3,
+  "zoo": 2,
+  "national_park": 2,
+  "theme_park": 2,
+  "gallery": 1
+ },
+ "tourism_by_kind": {
+  "poi": 1061,
+  "natural": 123,
+  "park": 26
+ }
+}
