@@ -100,7 +100,7 @@ def rail_feature(e):
     }
 
 
-def overpass(query, tries=6):
+def overpass(query, tries=8):
     last = None
     for i in range(tries):
         url = OVP[i % len(OVP)]
@@ -115,8 +115,9 @@ def overpass(query, tries=6):
             return j["elements"]
         except Exception as ex:
             last = ex
-            print(f"  attempt {i+1}: {ex}", file=sys.stderr)
-            time.sleep(20 * (i + 1))
+            wait = min(120, 15 * (i + 1))
+            print(f"  attempt {i+1}: {ex} — waiting {wait}s", file=sys.stderr)
+            time.sleep(wait)
     raise last
 
 
@@ -236,7 +237,8 @@ def main(out_dir="data"):
         rel = f"regions/{r['id']}.geojson"
         write_geojson(os.path.join(out_dir, rel), fs)
         meta["regions"].append({"id": r["id"], "name": r["name"],
-                                "file": rel, "count": len(fs)})
+                                "file": rel, "count": len(fs),
+                                "bbox": r["bbox"]})
         meta["files"]["3"].append(rel)
 
     json.dump(meta, open(os.path.join(out_dir, "meta.json"), "w"), indent=1)
