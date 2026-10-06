@@ -1,13 +1,9 @@
 {
-  "id": "tz",
-  "name": "Tanzania",
-  "name_local": "Tanzania",
-  "relation_id": 195270,
-  "bounds": [[29.34, -11.75], [40.44, -0.98]],
-  "languages": ["sw", "en"],
-  "default_lang": "sw",
-  "accent": "#1EB53A",
-  "admin": { "level": 4, "label": "Regions" },
-  "imagery": { "mapillary": true, "kartaview": true },
-  "official_source": { "name": "TANROADS", "url": "https://www.tanroads.go.tz" }
+  "id": "mw",
+  "name": "Malawi",
+  "relation_id": 195290,
+  "bounds": [[32.67, -17.13], [35.92, -9.37]],
+  "languages": ["en", "ny"],
+  "default_lang": "en",
+  "accent": "#CE1126"
 }
